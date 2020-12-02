@@ -28,6 +28,10 @@
 
 namespace glow {
 
+/// Dummy scale used for representing dummy quantization parameters that have
+/// been loaded in place of real quantization parameters.
+constexpr float dummyScale = 0.123456813395023345947265625;
+
 /// Profiling parameters of a tensor consisting in the global minimum and global
 /// maximum values and also the histogram obtained during profiling. To be noted
 /// that the histogram is not normalized.
@@ -335,7 +339,8 @@ chooseQuantizationParams(TensorProfilingParams profParams,
 /// for nodes like Convolution and FullyConnected given the initially computed
 /// parameters \p biasTQP and the parameters of the input \p inputTQP and the
 /// weights \p weightsTQP, for given quantization schema \p schema and bias type
-/// \p biasQTy. The bias operand requires a more thoughtful quantization since
+/// \p biasQTy. The parameter \p biasZero provides the information whether bias
+/// data is zero. The bias operand requires a more thoughtful quantization since
 /// every bias value has a higher impact on the precision of the output value
 /// than any particular weight value. The specialization logic is:
 /// - for INT32 bias quantization: since the dynamic range of INT32 is large we
@@ -355,7 +360,20 @@ TensorQuantizationParams
 specializeBiasQuantizationParams(const TensorQuantizationParams &biasTQP,
                                  const TensorQuantizationParams &inputTQP,
                                  const TensorQuantizationParams &weightsTQP,
-                                 Schema schema, ElemKind biasQTy);
+                                 Schema schema, ElemKind biasQTy,
+                                 bool biasZero = false);
+
+/// Function similar to \ref specializeBiasQuantizationParams with the main
+/// distinction that this function is also allowed to change the quantization
+/// parameters of the weights. The modification is done in place. This function
+/// is used for per-channel quantization. When the requested bias precision is
+/// INT32 this function ensures that bias_scale = input_scale * weights_scale
+/// while making sure the bias data is not saturated by changing both the bias
+/// and weights quantization parameters.
+void specializeBiasWeightsQuantizationParams(
+    TensorQuantizationParams &biasTQP, const TensorQuantizationParams &inputTQP,
+    TensorQuantizationParams &weightsTQP, Schema schema, ElemKind biasQTy,
+    bool biasZero = false);
 
 /// \returns an int8 vector mapping from the \p inTy to the \p outTy given the
 /// function \p f.
@@ -437,9 +455,9 @@ void tensorRowwiseQuantization(const Tensor &input, Tensor &output,
 /// |   .... int8 data ...    |   scale   |  offset   |
 /// |num_of_input_columns * 1B| sizeof(T) | sizeof(T) |
 /// For 4-bits quantization, in \p output, 1 byte will contain 2 quantized data.
-/// Template parameter \p T here must be float16_t.
-/// |   .... int4 data ...       | scale | offset |
-/// |num_of_input_columns * 0.5B |  2B   |   2B   |
+/// Template parameter \p T here could be either float or float16_t.
+/// |   .... int4 data ...       | scale        |   offset      |
+/// |num_of_input_columns * 0.5B |  sizeof(T)   |   sizeof(T)   |
 /// \pre input.dims().size() == 2
 /// \pre output.dims().size() == 2
 /// For 8-bits quantization:
@@ -460,11 +478,8 @@ void tensorFusedRowwiseQuantization(const Tensor &input, Tensor &output) {
     assert(input.dims()[1] + 2 * sizeof(T) == output.dims()[1] &&
            "Output must have 2*sizeof(T) more columns than input for 8-bits "
            "quantization.");
-  } else if (outputType == ElemKind::UInt4FusedFP16QTy) {
-    constexpr bool scaleIsFP16 = std::is_same<float16_t, T>::value;
-    (void)scaleIsFP16;
-    assert(scaleIsFP16 && "Only float16_t scale and offset are supported "
-                          "in 4-bit fused quantization");
+  } else if (outputType == ElemKind::UInt4FusedFP16QTy ||
+             outputType == ElemKind::UInt4FusedQTy) {
     assert(
         input.dims()[1] % 2 == 0 &&
         "4-bits fused quantization only works for the number of input column "
@@ -491,6 +506,7 @@ void tensorFusedRowwiseQuantization(const Tensor &input, Tensor &output) {
       range = 255.0;
       break;
     case ElemKind::UInt4FusedFP16QTy:
+    case ElemKind::UInt4FusedQTy:
       range = 15.0;
       break;
     default:
@@ -510,7 +526,8 @@ void tensorFusedRowwiseQuantization(const Tensor &input, Tensor &output) {
           outputType == ElemKind::UInt8FusedQTy) {
         destH.at({i, j}) = quantization::quantizeWithFloatOffset<uint8_t>(
             srcH.at({i, j}), scale, offset);
-      } else if (outputType == ElemKind::UInt4FusedFP16QTy) {
+      } else if (outputType == ElemKind::UInt4FusedFP16QTy ||
+                 outputType == ElemKind::UInt4FusedQTy) {
         uint8_t quantized = quantization::quantize4BitsWithFloatOffset(
             srcH.at({i, j}), scale, offset);
         if (j % 2 == 0) {

@@ -35,16 +35,6 @@
 
 namespace glow {
 
-/// Some model formats (Caffe2, PyTorch, TensorFlowLite) allow defining weights
-/// and activations in UINT8 format. Since Glow supports only INT8 weights and
-/// activations we do a transformation from UINT8 to INT8 quantized data by
-/// subtracting the value 128 from both the quantized values and the offset:
-///   val(int8) = val(uint8) - 128
-///   scale(int8) = scale(uint8) (scale value is preserved)
-///   offset(int8) = scale(uint8) - 128
-/// The constant definition below defines the value used for subtraction.
-constexpr int32_t UINT8_TO_INT8_SHIFT = 128;
-
 /// Result of loading a weight, potentially with additional offsets and
 /// scales tensors containing quantization parameters only if the loaded weight
 /// was found to have multiple quantization parameters.
@@ -61,6 +51,54 @@ struct LoadWeightResult {
   Type type;
 };
 
+#define dispatchQuantizedImpl(functionName, elemTy, ...)                       \
+  switch (elemTy) {                                                            \
+  case ElemKind::Int8QTy:                                                      \
+    functionName<int8_t>(__VA_ARGS__);                                         \
+    break;                                                                     \
+  case ElemKind::Int16QTy:                                                     \
+    functionName<int16_t>(__VA_ARGS__);                                        \
+    break;                                                                     \
+  case ElemKind::Int32QTy:                                                     \
+    functionName<int32_t>(__VA_ARGS__);                                        \
+    break;                                                                     \
+  default:                                                                     \
+    llvm_unreachable("Type is not supported");                                 \
+  }
+
+template <typename eTy>
+void rescaleQTensor(const Tensor &oldT, Tensor &rescaledT, float newMin,
+                    float newMax) {
+  const Type &oldTy = oldT.getType();
+  const TensorQuantizationParams oldQParams = {oldTy.getScale(),
+                                               oldTy.getOffset()};
+  const TensorQuantizationParams newQParams = chooseQuantizationParams(
+      {newMin, newMax}, quantization::Asymmetric, oldTy.getElementType());
+
+  // Setup Tensor to copy rescaled Tensor into.
+  Type rescaledTy(oldTy.getElementType(), oldTy.dims(), newQParams.scale,
+                  newQParams.offset);
+  rescaledT.reset(rescaledTy);
+
+  auto srcH = oldT.getHandle<eTy>();
+  auto destH = rescaledT.getHandle<eTy>();
+  for (size_t i = 0, e = destH.size(); i < e; ++i) {
+    float val = quantization::dequantize(srcH.raw(i), oldQParams);
+    destH.raw(i) = quantization::quantize(val, newQParams);
+  }
+}
+
+/// Given \p result, rescale it given \p newMin and \p newMax.
+template <typename eTy>
+void rescaleQTensorResult(LoadWeightResult &result, float newMin,
+                          float newMax) {
+  // Get new type based on newMin/newMax and old elem kind.
+  auto rescaledT = glow::make_unique<Tensor>();
+  rescaleQTensor<eTy>(*result.t, *rescaledT, newMin, newMax);
+  result.t = std::move(rescaledT);
+  result.type = result.t->getType();
+}
+
 /// Contains loaders for operators, which are common to ONNX and Caffe2
 /// formats. Every loader method adds necessary nodes to property G_, which
 /// is inherited from ProtobufLoader class, therefore modifying the class
@@ -76,7 +114,7 @@ class CommonOperatorLoader : public ProtobufLoader {
   loadWeight(const onnxTensorDescriptorV1 &in) {
     // Only support CPU memory tensors.
     if (in.memoryType != ONNXIFI_MEMORY_TYPE_CPU) {
-      RETURN_ERR("Only support CPU memory tensors.");
+      return MAKE_ERR("Only support CPU memory tensors.");
     }
 
     // Number of qparams in the onnxTensorDescriptor.
@@ -84,7 +122,7 @@ class CommonOperatorLoader : public ProtobufLoader {
 
     // Only support quantizationAxis=1 for now.
     if (qparams > 0 && in.quantizationAxis != 1) {
-      RETURN_ERR(strFormat(
+      return MAKE_ERR(strFormat(
           "Glow can only import quantized tensors with quantizationAxis=1 but "
           "the tensor %s has quantizationAxis=%u",
           in.name, in.quantizationAxis));
@@ -122,7 +160,7 @@ class CommonOperatorLoader : public ProtobufLoader {
               "Disallow overflow of loaded UINT64 data into Int64ITy.");
         }
       } else {
-        RETURN_ERR(strFormat(
+        return MAKE_ERR(strFormat(
             "Only float, index, and uint8 unquantized tensors are supported, "
             "got input with ONNXIFI_DATATYPE: %zu",
             static_cast<size_t>(in.dataType)));
@@ -144,17 +182,36 @@ class CommonOperatorLoader : public ProtobufLoader {
       scale = in.scales[0];
       offset = in.biases[0];
     } else {
+      RETURN_ERR_IF_NOT(!loadUniquedDummyQParams_,
+                        strFormat("Unsupported loading of uniqued qparams for "
+                                  "vector of scales/biases for %s",
+                                  in.name));
       Type scalesTy(ElemKind::FloatTy, llvm::makeArrayRef({qparams}));
       Type offsetsTy(ElemKind::Int32ITy, llvm::makeArrayRef({qparams}));
       result.scales = glow::make_unique<Tensor>((void *)in.scales, &scalesTy);
       result.offsets = glow::make_unique<Tensor>((void *)in.biases, &offsetsTy);
     }
 
+    // If we have a scale of dummyScale, then this must be a dummy pair of
+    // scale/offset. Look up the actual scale/offset to use as previously
+    // loaded, using the offset as the key to updatedTQPs_.
+    if (replaceDummyTQPs_ && scale == dummyScale) {
+      TensorQuantizationParams TQP;
+      ASSIGN_VALUE_OR_RETURN_ERR(TQP, getUpdatedTQP(offset));
+      scale = TQP.scale;
+      offset = TQP.offset;
+    }
+
     if (in.dataType == ONNXIFI_DATATYPE_UINT8) {
+      TypeRef outTy;
+      ASSIGN_VALUE_OR_RETURN_ERR(
+          outTy, ProtobufLoader::loadQuantTy(
+                     in.name, ElemKind::Int8QTy, dims, scale, offset,
+                     /* shiftUInt8ToInt8 */ true,
+                     /* skipClipQuantRangeToFP16 */ true));
       // Must copy the weights here because we will need to modify them by
       // adjusting for UINT8_TO_INT8_SHIFT.
-      result.type =
-          Type(ElemKind::Int8QTy, dims, scale, offset - UINT8_TO_INT8_SHIFT);
+      result.type = *outTy;
       if (!in.isOffline) {
         result.t->reset(result.type);
 
@@ -165,19 +222,57 @@ class CommonOperatorLoader : public ProtobufLoader {
         }
       }
     } else if (in.dataType == ONNXIFI_DATATYPE_INT32) {
-      result.type = Type(ElemKind::Int32QTy, dims, scale, offset);
+      TypeRef outTy;
+      ASSIGN_VALUE_OR_RETURN_ERR(
+          outTy, ProtobufLoader::loadQuantTy(
+                     in.name, ElemKind::Int32QTy, dims, scale, offset,
+                     /* shiftUInt8ToInt8 */ true,
+                     /* skipClipQuantRangeToFP16 */ true));
+      result.type = *outTy;
       if (!in.isOffline) {
         *result.t = Tensor((void *)in.buffer, &result.type);
       }
     } else if (in.dataType == ONNXIFI_DATATYPE_INT8) {
-      result.type = Type(ElemKind::Int8QTy, dims, scale, offset);
+      TypeRef outTy;
+      ASSIGN_VALUE_OR_RETURN_ERR(
+          outTy, ProtobufLoader::loadQuantTy(
+                     in.name, ElemKind::Int8QTy, dims, scale, offset,
+                     /* shiftUInt8ToInt8 */ false,
+                     /* skipClipQuantRangeToFP16 */ true));
+      result.type = *outTy;
       if (!in.isOffline) {
         *result.t = Tensor((void *)in.buffer, &result.type);
       }
     } else {
-      RETURN_ERR(strFormat("Only uint8, int32, and int8, quantized tensors are "
-                           "supported, got input with ONNXIFI_DATATYPE: %zu",
-                           static_cast<size_t>(in.dataType)));
+      return MAKE_ERR(
+          strFormat("Only uint8, int32, and int8, quantized tensors are "
+                    "supported, got input with ONNXIFI_DATATYPE: %zu",
+                    static_cast<size_t>(in.dataType)));
+    }
+
+    // If we're clipping quantized ranges tp FP16, then we need to rescale the
+    // Tensor and update its type, plus the type in result.
+    if (clipQuantRangeToFP16_) {
+      const ElemKind k = result.type.getElementType();
+      const auto qMinMax = getQuantizedValueRange(scale, offset, k);
+      const float newMin = std::max(qMinMax.first, kMinFP16);
+      const float newMax = std::min(qMinMax.second, kMaxFP16);
+
+      // If min or max are clipped then create a new Tensor with the adjusted
+      // type, and rescale its payload.
+      if (newMin != qMinMax.first || newMax != qMinMax.second) {
+        RETURN_ERR_IF_NOT(
+            !in.isOffline,
+            strFormat("For clipQuantRangeToFP16, currently do "
+                      "not support offline quantizated weights: %s",
+                      in.name));
+        RETURN_ERR_IF_NOT(!result.offsets && !result.scales,
+                          strFormat("For clipQuantRangeToFP16, currently do "
+                                    "not support multiple qparams: %s",
+                                    in.name));
+
+        dispatchQuantizedImpl(rescaleQTensorResult, k, result, newMin, newMax);
+      }
     }
 
     return Expected<LoadWeightResult>(std::move(result));
@@ -202,15 +297,64 @@ class CommonOperatorLoader : public ProtobufLoader {
 
 protected:
   CommonOperatorLoader(llvm::ArrayRef<const char *> names,
-                       llvm::ArrayRef<TypeRef> types, Function *F)
-      : ProtobufLoader(names, types, F) {}
+                       llvm::ArrayRef<TypeRef> types, Function *F,
+                       Error *errPtr = nullptr,
+                       bool loadIntoExistingModule = false,
+                       OriginNameToTQPMap *originNameToTQPMap = nullptr,
+                       bool loadUniquedDummyQParams = false,
+                       bool zeroScaleFP16Clip = false,
+                       bool clipQuantRangeToFP16 = false)
+      : ProtobufLoader(names, types, F, errPtr, loadIntoExistingModule,
+                       originNameToTQPMap, loadUniquedDummyQParams,
+                       /* replaceDummyTQPs */ false, zeroScaleFP16Clip,
+                       clipQuantRangeToFP16) {}
 
-  CommonOperatorLoader(llvm::ArrayRef<const char *> names,
-                       llvm::ArrayRef<TypeRef> types, Module &mod)
-      : ProtobufLoader(names, types, mod) {}
+  CommonOperatorLoader(
+      llvm::ArrayRef<const char *> names, llvm::ArrayRef<TypeRef> types,
+      Module &mod, Error *errPtr = nullptr, bool loadIntoExistingModule = false,
+      OriginNameToTQPMap *originNameToTQPMap = nullptr,
+      bool loadUniquedDummyQParams = false, bool replaceDummyTQPs = false,
+      bool zeroScaleFP16Clip = false, bool clipQuantRangeToFP16 = false)
+      : ProtobufLoader(names, types, mod, errPtr, loadIntoExistingModule,
+                       originNameToTQPMap, loadUniquedDummyQParams,
+                       replaceDummyTQPs, zeroScaleFP16Clip,
+                       clipQuantRangeToFP16) {}
 
   using ArgumentDictionaryTy =
       std::unordered_map<std::string, const AttrType *>;
+
+  /// If we were replacing or loading dummy TQPs, \returns success if there
+  /// aren't any dummies left, or there are only dummies left.
+  Error verifyDummyQParams() {
+    RETURN_ERR_IF_NOT(!(replaceDummyTQPs_ && loadUniquedDummyQParams_),
+                      "Cannot replace dummy TQPs when loading uniqued TQPs.");
+    if (replaceDummyTQPs_ || loadUniquedDummyQParams_) {
+      RETURN_IF_ERR(mod_.verifyDummyQParams(loadUniquedDummyQParams_));
+    }
+    return Error::success();
+  }
+
+  /// Helper to load quantization parameters from \p dict for op named \p name.
+  /// \returns a new TypeRef given \p k and \p dims.
+  Expected<TypeRef> loadQuantTy(const std::string &name, ElemKind k,
+                                llvm::ArrayRef<dim_t> dims,
+                                ArgumentDictionaryTy &dict,
+                                bool skipClipQuantRangeToFP16 = false) {
+    RETURN_ERR_IF_NOT(dict.count("Y_scale"),
+                      "missing Y_scale for quantized output type for " + name);
+    RETURN_ERR_IF_NOT(dict.count("Y_zero_point"),
+                      "missing zero point for quantized output type for " +
+                          name);
+
+    float scale;
+    ASSIGN_VALUE_OR_RETURN_ERR(scale, loadFloat(dict["Y_scale"]));
+    int32_t offset;
+    ASSIGN_VALUE_OR_RETURN_ERR(offset, loadInt(dict["Y_zero_point"]));
+
+    return ProtobufLoader::loadQuantTy(name, k, dims, scale, offset,
+                                       /* shiftUInt8ToInt8 */ true,
+                                       skipClipQuantRangeToFP16);
+  }
 
   /// \returns True if the operator has broadcasting activated.
   virtual Expected<bool> getBroadcast(ArgumentDictionaryTy &dict) = 0;
@@ -239,6 +383,11 @@ protected:
     return avgLength;
   }
 
+  const std::string opErrMsg(const OpType &op, const std::string &errMsg) {
+    const std::string &opName = loadOperatorName(op);
+    return strFormat(" [Operator-'%s'] : %s ", opName.c_str(), errMsg.c_str());
+  }
+
   /// Associate the name of operation outputs to a NodeValues corresponding to
   /// node \p node. If \p numOutputs is lower than 0, then all outputs are
   /// associated. Otherwise, the first \p numOutputs outputs are associated.
@@ -258,29 +407,6 @@ protected:
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
     auto *R = G_->createRELU(opName, in);
-    RETURN_IF_ERR(addNodeAsOutput(op, R));
-    return Error::success();
-  }
-
-  /// Loads PRELU operator, given its protobuf representation and parsed args.
-  /// Follows undirectional broadcasting described here:
-  /// https://github.com/onnx/onnx/blob/fb1a80692c1ab0bd27b1072f2e7bffacba336777/docs/Broadcasting.md
-  Error loadPRelu(const OpType &op, ArgumentDictionaryTy &dict) {
-    const std::string &opName = loadOperatorName(op);
-
-    NodeValue in;
-    ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
-
-    NodeValue slope;
-    ASSIGN_VALUE_OR_RETURN_ERR(slope, getNodeValueByName(op.input(1)));
-
-    // Do broadcasting.
-    auto targetDim = in.dims();
-    // Sets the axis of each inputs so that the trailing-most dimensions of
-    // input tensors and the target shape are aligned.
-    int axis = targetDim.size() - slope.dims().size();
-    auto *finalSlope = G_->createBroadcast(opName, slope, targetDim, axis);
-    auto *R = G_->createPRELU(opName, in, finalSlope);
     RETURN_IF_ERR(addNodeAsOutput(op, R));
     return Error::success();
   }
@@ -384,7 +510,13 @@ protected:
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
 
-    RETURN_ERR_IF_NOT(in.dims().size() >= 2, "SoftMax input dims must be >= 2");
+    RETURN_ERR_IF_NOT(
+        in.dims().size() >= 2,
+        opErrMsg(
+            op,
+            strFormat(
+                "SoftMax input dims must be >= 2, but found input dims %zu ",
+                in.dims().size())));
 
     // Create a constant to store labels to be used in SoftMaxGradNode.
     auto *selected = G_->createSplat(
@@ -451,7 +583,7 @@ protected:
     } else if (typeName == "Max") {
       node = G_->createNodeWithBroadcast<MaxNode>(opName, -1, in0, in1);
     } else {
-      RETURN_ERR("Invalid min or max operator");
+      return MAKE_ERR(opErrMsg(op, "Invalid min or max operator"));
     }
 
     RETURN_IF_ERR(addNodeAsOutput(op, node));
@@ -582,7 +714,7 @@ protected:
       } else if (typeName == "Div") {
         node = G_->createNodeWithBroadcast<DivNode>(opName, axis, in0, in1);
       } else {
-        RETURN_ERR("Unsupported arithmetic typeName");
+        return MAKE_ERR("Unsupported arithmetic typeName");
       }
     } else {
       if (typeName == "Mul") {
@@ -594,7 +726,7 @@ protected:
       } else if (typeName == "Div") {
         node = G_->createDiv(opName, in0, in1);
       } else {
-        RETURN_ERR("Unsupported arithmetic typeName");
+        return MAKE_ERR("Unsupported arithmetic typeName");
       }
     }
 
@@ -638,7 +770,9 @@ protected:
     std::vector<dim_t> requestedDims;
     if (op.input_size() > 1) {
       if (!getConstantByNameOrNull(op.input(1))) {
-        RETURN_ERR("Non-constant shape tensors are unsupported by Glow.");
+        return MAKE_ERR(opErrMsg(
+            op,
+            "Reshape: Non-constant shape tensors are unsupported by Glow."));
       }
       const Constant *constShapeConst;
       ASSIGN_VALUE_OR_RETURN_ERR(constShapeConst,
@@ -648,8 +782,11 @@ protected:
         requestedDims.push_back(dim);
       }
     } else if (dict.count("shape")) {
-      RETURN_ERR_IF_NOT(op.input_size() == 1,
-                        "Cannot specify new shape by both argument and input.");
+      RETURN_ERR_IF_NOT(
+          op.input_size() == 1,
+          opErrMsg(
+              op,
+              "Reshape: Cannot specify new shape by both argument and input."));
       std::vector<int64_t> protoDims;
       ASSIGN_VALUE_OR_RETURN_ERR(protoDims, getShape<int64_t>(dict["shape"]));
 
@@ -657,7 +794,9 @@ protected:
         requestedDims.push_back(dim);
       }
     } else {
-      RETURN_ERR("Missing output shape information for the Reshape operator.");
+      return MAKE_ERR(opErrMsg(op,
+                               "Reshape: Missing output shape information for "
+                               "the Reshape operator."));
     }
 
     // Compute the actual new shape
@@ -678,8 +817,11 @@ protected:
       } else {
         // -1 means that the corresponding dimension should be inferred
         // from all other dimensions, so that tensor size remains the same.
-        RETURN_ERR_IF_NOT(negOneIndex < 0,
-                          "At most one dimension of the new shape can be -1.");
+        RETURN_ERR_IF_NOT(
+            negOneIndex < 0,
+            opErrMsg(
+                op,
+                "Reshape: At most one dimension of the new shape can be -1."));
         negOneIndex = (ssize_t)i;
         // The -1 case value is handled later.
         outputDims.push_back(0);
@@ -707,7 +849,9 @@ protected:
     // one contains permutation under name "perm", the other contains it under
     // argument name "axes". That's why the name is passed as a parameter.
     std::vector<unsigned_t> perm;
-    ASSIGN_VALUE_OR_RETURN_ERR(perm, getShape<unsigned_t>(dict[permArgName]));
+    if (dict.count(permArgName))
+      ASSIGN_VALUE_OR_RETURN_ERR(perm, getShape<unsigned_t>(dict[permArgName]));
+
     if (perm.empty()) {
       // Empty permutation argument means reversing axes order.
       size_t N = in.dims().size();
@@ -755,10 +899,12 @@ protected:
           PH = mod_.createPlaceholder(in.getType(), op.output(0),
                                       /* isTrainable */ false);
         } else {
-          RETURN_ERR_IF_NOT(loadIntoExistingModule_,
-                            "Found pre-existing PH by name " + op.output(0));
-          RETURN_ERR_IF_NOT(PH->getType()->isEqual(in.getType()),
-                            "Mismatch on pre-existing intermediate PH type");
+          RETURN_ERR_IF_NOT(
+              loadIntoExistingModule_,
+              opErrMsg(op, "Found pre-existing PH by name " + op.output(0)));
+          RETURN_ERR_IF_NOT(
+              PH->getType()->isEqual(in.getType()),
+              opErrMsg(op, "Mismatch on pre-existing intermediate PH type"));
         }
         G_->createSave(opName, in, PH, /* skipSuffix */ true);
         intermediatePHsByName_[op.output(0)] = PH;
@@ -774,13 +920,25 @@ protected:
     const std::string &opName = loadOperatorName(op);
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
-    RETURN_ERR_IF_NOT(op.input_size() <= 2, "Maximum number of inputs is 2.");
+    RETURN_ERR_IF_NOT(
+        op.input_size() <= 2,
+        opErrMsg(
+            op,
+            strFormat(
+                "TopK: Maximum number of inputs is 2, but found input size %d ",
+                op.input_size())));
     unsigned_t k = 0;
     if (op.input_size() > 1) {
       Constant *kConst = getConstantByNameOrNull(op.input(1));
-      RETURN_ERR_IF_NOT(kConst, "Non-constant k is not supported by Glow.");
-      RETURN_ERR_IF_NOT(kConst->getElementType() == ElemKind::Int64ITy,
-                        "k input must be of type Int64.");
+      RETURN_ERR_IF_NOT(
+          kConst,
+          opErrMsg(op, "TopK: Non-constant k is not supported by Glow."));
+      RETURN_ERR_IF_NOT(
+          kConst->getElementType() == ElemKind::Int64ITy,
+          opErrMsg(op, strFormat(
+                           "TopK: k input must be of type Int64, but found "
+                           "input type '%s' ",
+                           kConst->getType()->getElementName().str().c_str())));
       auto constH = kConst->getPayload().getHandle<int64_t>();
       k = constH.at({0});
     } else {
@@ -794,8 +952,13 @@ protected:
                                  loadAxis<int>(dict["axis"], in.dims().size()));
     }
 
-    RETURN_ERR_IF_NOT(axis == lastDim,
-                      "Currently only support axis being last dimension.");
+    RETURN_ERR_IF_NOT(
+        axis == lastDim,
+        opErrMsg(
+            op,
+            strFormat(
+                "TopK: Currently only support axis %d being last dimension %d ",
+                axis, lastDim)));
 
     auto *R = G_->createTopK(opName, in, k);
     RETURN_IF_ERR(addNodeAsOutput(op, R));
@@ -825,8 +988,8 @@ protected:
     if (axes.size() > 1) {
       auto it = std::unique(shapeAxes.begin(), shapeAxes.end());
       if (it != shapeAxes.end()) {
-        RETURN_ERR("Axes values are not unique.",
-                   ErrorValue::ErrorCode::MODEL_LOADER_UNSUPPORTED_SHAPE);
+        return MAKE_ERR(opErrMsg(op, "ReduceOp Axes values are not unique."),
+                        ErrorValue::ErrorCode::MODEL_LOADER_UNSUPPORTED_SHAPE);
       }
     }
 
@@ -847,7 +1010,7 @@ protected:
     } else if (typeName == "ReduceMax") {
       node = G_->createBatchedReduceMax(opName, in, axes);
     } else {
-      RETURN_ERR("Unsupported Reduce Op " + typeName.str());
+      return MAKE_ERR("Unsupported Reduce Op " + typeName.str());
     }
 
     // Our batched reduce add/mean does not keep the dim; reshape if necessary.
@@ -989,8 +1152,12 @@ protected:
     NodeValue lengths;
     ASSIGN_VALUE_OR_RETURN_ERR(lengths, getNodeValueByName(op.input(1)));
 
-    RETURN_ERR_IF_NOT(lengths.dims().size() == 1,
-                      "Lengths must be a 1D vector.");
+    RETURN_ERR_IF_NOT(
+        lengths.dims().size() == 1,
+        opErrMsg(
+            op,
+            strFormat("LengthsSum: Lengths must be a 1D vector, but found %zu ",
+                      lengths.dims().size())));
 
     auto *node = G_->createLengthsSum(opName, data, lengths);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
@@ -1009,27 +1176,13 @@ protected:
     return Error::success();
   }
 
-  Error loadClip(const OpType &op, ArgumentDictionaryTy &dict) {
-    NodeValue in;
-    ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
-    float cmin = std::numeric_limits<float>::lowest();
-    if (dict.count("min")) {
-      ASSIGN_VALUE_OR_RETURN_ERR(cmin, loadFloat(dict.find("min")->second));
-    }
-
-    float cmax = std::numeric_limits<float>::max();
-    if (dict.count("max")) {
-      ASSIGN_VALUE_OR_RETURN_ERR(cmax, loadFloat(dict.find("max")->second));
-    }
-
-    auto *node = G_->createClip(loadOperatorName(op), in, cmin, cmax);
-    RETURN_IF_ERR(addNodeAsOutput(op, node));
-    return Error::success();
-  }
-
   Error loadSparseToDense(const OpType &op, ArgumentDictionaryTy &dict) {
     if (op.input_size() != 3) {
-      RETURN_ERR("SparseToDense operator must have three inputs.");
+      return MAKE_ERR(opErrMsg(
+          op,
+          strFormat(
+              "SparseToDense operator must have three inputs, but found %d ",
+              op.input_size())));
     }
 
     NodeValue indices;
@@ -1048,7 +1201,10 @@ protected:
   Error loadSparseToDenseMask(const OpType &op, ArgumentDictionaryTy &dict) {
     size_t inputSize = op.input_size();
     if (inputSize != 3 && inputSize != 4) {
-      RETURN_ERR("SparseToDenseMask operator must have 3 or 4 inputs.");
+      return MAKE_ERR(
+          opErrMsg(op, strFormat("SparseToDenseMask operator must have "
+                                 "3 or 4 inputs, but found %zu ",
+                                 inputSize)));
     }
 
     NodeValue indices;
@@ -1093,10 +1249,6 @@ protected:
       int axis;
       ASSIGN_VALUE_OR_RETURN_ERR(
           axis, loadAxis<int>(dict.find("axis")->second, data.dims().size()));
-      if (axis != 0 && axis != 1) {
-        RETURN_ERR("Axis must be 0 or 1.");
-      }
-
       batchDims = axis;
     }
 
@@ -1115,21 +1267,56 @@ protected:
     return Error::success();
   }
 
+  Error loadGatherND(const std::string &typeName, const OpType &op,
+                     const ArgumentDictionaryTy &dict) {
+
+    NodeValue data;
+    ASSIGN_VALUE_OR_RETURN_ERR(data, getNodeValueByName(op.input(0)));
+    NodeValue indices;
+    ASSIGN_VALUE_OR_RETURN_ERR(indices, getNodeValueByName(op.input(1)));
+
+    if (indices.getElementType() != ElemKind::Int64ITy &&
+        indices.getElementType() != ElemKind::Int32ITy) {
+      // If the index type is not Int32 or Int64 insert a conversion layer to
+      // introduce robustness against model problems. Constant Float indices
+      // will get converted to integer indices via constant folding pass.
+      indices = G_->createConvertTo(
+          loadOperatorName(op) + "_idx_convertToi32", indices,
+          G_->getParent()->uniqueType(ElemKind::Int32ITy, indices.dims()));
+    }
+
+    auto *GN = G_->createGatherND(loadOperatorName(op), data, indices);
+    RETURN_IF_ERR(addNodeAsOutput(op, GN));
+    return Error::success();
+  }
+
   Error loadGatherRanges(const std::string &typeName, const OpType &op,
                          ArgumentDictionaryTy &dict) {
     NodeValue data;
     ASSIGN_VALUE_OR_RETURN_ERR(data, getNodeValueByName(op.input(0)));
-    RETURN_ERR_IF_NOT(data.dims().size() == 1, "Data must be a 1D vector.");
+    RETURN_ERR_IF_NOT(
+        data.dims().size() == 1,
+        opErrMsg(op, strFormat("GatherRanges: Data must be a 1D vector, but "
+                               "found vector size %zu ",
+                               data.dims().size())));
 
     NodeValue ranges;
     ASSIGN_VALUE_OR_RETURN_ERR(ranges, getNodeValueByName(op.input(1)));
-    RETURN_ERR_IF_NOT(ranges.dims().size() == 3, "Ranges must be a 3D vector.");
-    RETURN_ERR_IF_NOT(ranges.dims()[2] == 2,
-                      "Last dimension of ranges must be 2.");
+    RETURN_ERR_IF_NOT(
+        ranges.dims().size() == 3,
+        opErrMsg(op, strFormat("GatherRanges: Ranges must be a 3D vector, but "
+                               "found vector size %zu ",
+                               ranges.dims().size())));
+    RETURN_ERR_IF_NOT(
+        ranges.dims()[2] == 2,
+        opErrMsg(op, strFormat("GatherRanges: Last dimension of "
+                               "ranges must be 2, but found %s",
+                               std::to_string(ranges.dims()[2]).c_str())));
 
     auto maxOutputSizeIt = dict.find("maxOutputSize");
     RETURN_ERR_IF_NOT(maxOutputSizeIt != dict.end(),
-                      "Require maxOutputSize when loading LengthsRangeFill.");
+                      opErrMsg(op, "GatherRanges: Require maxOutputSize when "
+                                   "loading LengthsRangeFill."));
     unsigned_t maxOutputSize;
     ASSIGN_VALUE_OR_RETURN_ERR(maxOutputSize, loadInt(maxOutputSizeIt->second));
 
@@ -1174,7 +1361,7 @@ protected:
     } else if (typeName == "Xor") {
       N = G_->createNodeWithBroadcast<XorNode>(opName, axis, xNV, yNV);
     } else {
-      RETURN_ERR("Unsupported Logical Operator");
+      return MAKE_ERR("Unsupported Logical Operator");
     }
     RETURN_IF_ERR(addNodeAsOutput(op, N));
     return Error::success();
@@ -1201,8 +1388,6 @@ protected:
     return Error::success();
   }
 
-  using ProtobufLoader::ProtobufLoader;
-
   /// If operator type is supported, returns Expected<true> and creates new
   /// operator. Returns Operator<false> if operator type is not supported.
   /// Returns Error if an error occurred
@@ -1211,10 +1396,6 @@ protected:
                                        ArgumentDictionaryTy &dict) {
     if (typeName == "Relu") {
       RETURN_IF_ERR(loadRelu(op, dict));
-      return true;
-    }
-    if (typeName == "PRelu") {
-      RETURN_IF_ERR(loadPRelu(op, dict));
       return true;
     }
     if (typeName == "Sigmoid") {
@@ -1362,10 +1543,6 @@ protected:
       RETURN_IF_ERR(loadExpandDims(op, dict));
       return true;
     }
-    if (typeName == "Clip") {
-      RETURN_IF_ERR(loadClip(op, dict));
-      return true;
-    }
     if (typeName == "SparseToDense") {
       RETURN_IF_ERR(loadSparseToDense(op, dict));
       return true;
@@ -1376,6 +1553,10 @@ protected:
     }
     if (typeName == "Gather" || typeName == "BatchGather") {
       RETURN_IF_ERR(loadGatherOps(typeName, op, dict));
+      return true;
+    }
+    if (typeName == "GatherND") {
+      RETURN_IF_ERR(loadGatherND(typeName, op, dict));
       return true;
     }
     if (typeName == "GatherRanges") {
@@ -1439,12 +1620,19 @@ protected:
       if (auto resOrErr = loadWeight(weightDescriptors[i])) {
         loadResult = std::move(*resOrErr);
       } else {
-        return resOrErr.takeError();
+        RETURN_ERR(resOrErr.takeError());
       }
 
       // If the weight is offline create a static placeholder, otherwise create
       // a constant.
       if (weightDescriptors[i].isOffline) {
+        RETURN_ERR_IF_NOT(
+            !clipQuantRangeToFP16_ ||
+                !loadResult.t->getType().isQuantizedType() ||
+                loadResult.t->getType().isFusedQuantizedType(),
+            strFormat("Do not support clipQuantRangeToFP16 with unfused "
+                      "quantized input Placeholders: %s",
+                      name));
         Placeholder *pl;
         ASSIGN_VALUE_OR_RETURN_ERR(
             pl, createAndRegisterPlaceholder(name, &loadResult.type,
@@ -1505,6 +1693,42 @@ protected:
     }
 
     return Error::success();
+  }
+
+  static Expected<bool> getCountIncludePads(ArgumentDictionaryTy &dict,
+                                            bool defaultValue) {
+    if (dict.count("count_include_pad")) {
+      int countIncludePads;
+      ASSIGN_VALUE_OR_RETURN_ERR(countIncludePads,
+                                 loadInt(dict.at("count_include_pad")));
+      return (bool)countIncludePads;
+    }
+    // Return default value if can't find in the dict
+    return defaultValue;
+  }
+
+  static Expected<std::vector<unsigned_t>>
+  getDilations(ArgumentDictionaryTy &dict,
+               const std::vector<unsigned_t> &defaultValue) {
+    // For Caffe2 Model, `dilation` field can be either one integer or multiple
+    // integers (one for each axis). When it's one integer the field in the dict
+    // will be `dilation`. Otherwise, the field in the dict will be `dilations`.
+
+    // For Onnx Model, it can only be `dilations` and it must be a list of
+    // integers.
+    if (dict.count("dilation")) {
+      unsigned_t dilation;
+      ASSIGN_VALUE_OR_RETURN_ERR(dilation, loadInt(dict.at("dilation")));
+      return std::vector<unsigned_t>{dilation, dilation};
+    }
+    if (dict.count("dilations")) {
+      std::vector<unsigned_t> shape;
+      ASSIGN_VALUE_OR_RETURN_ERR(shape,
+                                 getShape<unsigned_t>(dict["dilations"]));
+      return shape;
+    }
+
+    return defaultValue;
   }
 };
 

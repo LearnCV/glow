@@ -27,6 +27,7 @@ add_library(PyTorchModelLoader
                      GlowFuser.cpp
                      FuseKnownPatterns.cpp
                      GlowIValue.cpp
+                     InputMeta.cpp
                      PyTorchCommon.cpp
                      Registration.cpp
                      PyTorchModelLoader.cpp
@@ -53,15 +54,6 @@ target_link_libraries(PyTorchModelLoader
                         Runtime
                         PyTorchShapeInference)
 
-add_library(PyTorchFileLoader
-                     PyTorchFileLoader.cpp)
-target_compile_options(PyTorchFileLoader
-                      PRIVATE
-                        -frtti -fexceptions -DC10_USE_GLOG)
-target_link_libraries(PyTorchFileLoader
-                      PUBLIC
-                        PyTorchModelLoader)
-
 pybind11_add_module(_torch_glow
                       binding.cpp)
 
@@ -71,14 +63,7 @@ target_compile_options(_torch_glow
 target_link_libraries(_torch_glow
                       PRIVATE
                         PyTorchModelLoader
-                        TorchGlowTraining
                         Backends
-                        pybind11
                         torch_python)
 
 include_directories(${PYTORCH_DIR}/include)
-
-target_include_directories(_torch_glow PUBLIC
-                            ${TORCH_GLOW}/src/training)
-
-add_subdirectory(training)

@@ -196,20 +196,21 @@ Tensor dequantizeTensor(const Tensor &tensor, ElemKind floatKind) {
   return tmp;
 }
 
-Tensor tensor4BitsFusedRowwiseDequantization(const Tensor &input) {
+template <class T = float16_t>
+static Tensor tensor4BitsFusedRowwiseDequantizationUtil(const Tensor &input) {
   assert(input.dims().size() == 2 && "Input must be 2 dimensional.");
   // The output tensor should have the same raw as input tensor. Since the
   // quantized tensor is in the following format: | 4bit quantized data |
-  // float16_t scale | float16_t offset| The columns of dequantized float data
-  // should be (input.dims()[1] - 2*sizeof(float16_t)) * 2.
+  // T scale | T offset| The columns of dequantized float data
+  // should be (input.dims()[1] - 2*sizeof(T)) * 2.
   Tensor output(
       ElemKind::FloatTy,
-      {input.dims()[0], (dim_t)(input.dims()[1] - 2 * sizeof(float16_t)) * 2});
+      {input.dims()[0], (dim_t)(input.dims()[1] - 2 * sizeof(T)) * 2});
   auto srcH = input.getHandle<uint8_t>();
   auto destH = output.getHandle<float>();
   for (dim_t i = 0; i < input.dims()[0]; i++) {
-    float16_t scale, offset;
-    std::tie(scale, offset) = srcH.getFusedScaleOffsetFromRow<float16_t>(i);
+    T scale, offset;
+    std::tie(scale, offset) = srcH.getFusedScaleOffsetFromRow<T>(i);
     for (dim_t j = 0; j < output.dims()[1]; j++) {
       bool isMSB = (j % 2 == 1);
       destH.at({i, j}) = dequantize4BitWithFloatOffset(
@@ -218,6 +219,16 @@ Tensor tensor4BitsFusedRowwiseDequantization(const Tensor &input) {
     }
   }
   return output;
+}
+
+Tensor tensor4BitsFusedRowwiseDequantization(const Tensor &input) {
+  auto Ty = input.getType().getElementType();
+  assert((Ty == ElemKind::UInt4FusedFP16QTy || Ty == ElemKind::UInt4FusedQTy) &&
+         "Unsupported 4bits fused rw quantization type.");
+  if (Ty == ElemKind::UInt4FusedFP16QTy) {
+    return tensor4BitsFusedRowwiseDequantizationUtil<float16_t>(input);
+  }
+  return tensor4BitsFusedRowwiseDequantizationUtil<float>(input);
 }
 
 QuantizationTransform32To8 quantizeScaleOffset32To8(float scale,
@@ -555,7 +566,8 @@ TensorQuantizationParams
 specializeBiasQuantizationParams(const TensorQuantizationParams &biasTQP,
                                  const TensorQuantizationParams &inputTQP,
                                  const TensorQuantizationParams &weightsTQP,
-                                 Schema schema, ElemKind biasQTy) {
+                                 Schema schema, ElemKind biasQTy,
+                                 bool biasZero) {
   // Choose bias offset. For int32 bias we always force offset 0 in order
   // to simplify the implementation since the dynamic range allows it.
   int32_t biasOffset = biasTQP.offset;
@@ -563,18 +575,55 @@ specializeBiasQuantizationParams(const TensorQuantizationParams &biasTQP,
     biasOffset = 0;
   }
   // Choose bias scale. We try to force the bias scale value to the product
-  // scaleInput * scaleWeights but only if the resulting scale is larger
+  // inputScale * weightsScale but only if the resulting scale is larger
   // (in order to avoid bias data saturation).
-  float scaleInput = inputTQP.scale;
-  float scaleWeights = weightsTQP.scale;
+  float inputScale = inputTQP.scale;
+  float weightsScale = weightsTQP.scale;
   float biasScale = biasTQP.scale;
-  if (scaleInput * scaleWeights > biasScale) {
-    biasScale = scaleInput * scaleWeights;
+  if (inputScale * weightsScale >= biasScale || biasZero) {
+    biasScale = inputScale * weightsScale;
   }
   // Validate new bias TQP and return.
   TensorQuantizationParams biasTQPNew = {biasScale, biasOffset};
   validateQuantizationParams(biasTQPNew, schema, biasQTy);
   return biasTQPNew;
+}
+
+void specializeBiasWeightsQuantizationParams(
+    TensorQuantizationParams &biasTQP, const TensorQuantizationParams &inputTQP,
+    TensorQuantizationParams &weightsTQP, Schema schema, ElemKind biasQTy,
+    bool biasZero) {
+  // Choose bias offset. For int32 bias we always force offset 0 in order
+  // to simplify the implementation since the dynamic range allows it.
+  if (biasQTy == ElemKind::Int32QTy) {
+    biasTQP.offset = 0;
+  }
+  // Choose bias scale. We try to force the bias scale value to the product
+  // inputScale * weightsScale but only if the resulting scale is larger
+  // (in order to avoid bias data saturation). Otherwise, for INT32 bias
+  // only, we change the weightsScale to enforce the equality.
+  float inputScale = inputTQP.scale;
+  float weightsScale = weightsTQP.scale;
+  float biasScale = biasTQP.scale;
+  if (inputScale * weightsScale >= biasScale || biasZero) {
+    biasScale = inputScale * weightsScale;
+  } else {
+    if (biasQTy == ElemKind::Int32QTy) {
+      weightsScale = biasScale / inputScale;
+      // The division above does not always ensure that biasScale equals the
+      // product inputScale * weightsScale because float32 division is not
+      // that accurate. Instead we force the equality explicitly.
+      biasScale = inputScale * weightsScale;
+    }
+  }
+  biasTQP.scale = biasScale;
+  weightsTQP.scale = weightsScale;
+  // Validate new bias and weights TQP.
+  if (biasQTy == ElemKind::Int32QTy) {
+    assert((biasTQP.scale == (inputTQP.scale * weightsTQP.scale)) &&
+           "Bias scale invalid!");
+  }
+  validateQuantizationParams(biasTQP, schema, biasQTy);
 }
 
 std::vector<int8_t> createMapping(TypeRef inTy, TypeRef outTy,

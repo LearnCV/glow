@@ -98,6 +98,9 @@ class ONNXModelWriter : public CommonOperatorWriter<ONNX_TRAITS> {
   /// Maps from all output PHs to the generated proto. It's used to buffer
   /// protos; later on written out in order based on \ref loadedPHNames_.
   std::unordered_map<const Placeholder *, ValueInfoType> outputValueInfos_;
+  /// Output string. Null value indicates that the output is to be written to a
+  /// file.
+  std::string *outputStringPtr_;
 
   /// Creates and \returns a new ValueInfoType for \p PH based on \p isInput.
   /// It's added either directy to \ref graphProto_, or to \ref inputValueInfos_
@@ -159,7 +162,17 @@ class ONNXModelWriter : public CommonOperatorWriter<ONNX_TRAITS> {
   /// (i.e. both input and an output for Functions in \ref functionsFromDAG_).
   bool isIntermediatePHForDAG(const Placeholder *PH);
 
+  /// \returns True if the operator with the name \p typeName has support for
+  /// multidirectional broadcasting.
+  bool hasMultidirectionalBroadcast(const llvm::StringRef typeName);
+
 public:
+  /// Inserts the mapping in \p map into \p extraMetadataProps. \returns an
+  /// error if the key already exists for the map in \p extraMetadataProps.
+  static Error insertLoaderNameUniqueOffsetMetadata(
+      llvm::StringMap<std::string> &extraMetadataProps,
+      const OriginNameToTQPMap &map);
+
   /// Converts \p glowType to \p protoType.
   static typename TensorType::DataType convertType(const Type &glowType);
   /// Writes Glow tensor \p T to proto output \p out. Depending on
@@ -197,7 +210,8 @@ public:
                       llvm::StringMap<std::string>(),
                   const ConstantFoldingRecordMap &constFoldRecord =
                       ConstantFoldingRecordMap(),
-                  const BackendSpecificNodeInfo &backendSpecificNodeInfo = {});
+                  const BackendSpecificNodeInfo &backendSpecificNodeInfo = {},
+                  std::string *outputStringPtr = nullptr);
 
   /// Creates an ONNX model writer to serialize \p dagList into file
 
@@ -229,13 +243,15 @@ public:
           ConstantFoldingRecordMap(),
       const BackendSpecificNodeInfo &backendSpecificNodeInfo = {},
       const LoadedPlaceholderNameMap *loadedPHNames = nullptr,
-      const std::map<std::string, Type> *staticPlaceholderTypes = nullptr);
+      const std::map<std::string, Type> *staticPlaceholderTypes = nullptr,
+      std::string *outputStringPtr = nullptr);
 
 private:
   /// \returns error for the unexpected node kind.
   static Error writeUnexpectedKind(const Node *node) {
-    RETURN_ERR(strFormat("Glow can not export node %s, unsupported kind: %s.",
-                         node->getName().str().c_str(), node->getKindName()));
+    return MAKE_ERR(
+        strFormat("Glow can not export node %s, unsupported kind: %s.",
+                  node->getName().str().c_str(), node->getKindName()));
   }
 
   /// Declares the overriden all pure virtual methods, declared in base class.

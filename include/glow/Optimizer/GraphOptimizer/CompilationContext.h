@@ -34,6 +34,11 @@ class DeferredWeightLoader;
 using LoadedPlaceholderNameMap =
     std::unordered_map<const Placeholder *, std::pair<std::string, unsigned>>;
 
+/// Map from the name of the original op that some quantization parameters was
+/// loaded from to those associated quantization parameters.
+using OriginNameToTQPMap =
+    std::unordered_map<std::string, TensorQuantizationParams>;
+
 /// Configuration for different precision modes.
 struct PrecisionConfiguration {
   /// Enum for what kind of transformation should be done for Quantization.
@@ -63,6 +68,18 @@ struct PrecisionConfiguration {
   /// Whether to convert UInt8FusedQTy to UInt8FusedFP16QTy in the Function.
   bool convertFusedToFP16{false};
 
+  /// Whether to convert UInt4FusedFP16QTy to UInt8FusedQTy in the Function.
+  bool convert4BitFusedTo8Bit{false};
+
+  /// Whether to convert UInt8FusedFP16QTy to UInt8FusedQTy in the Function.
+  bool convert8BitFusedToFP32{false};
+
+  /// Whether to convert UInt4FusedFP16QTy to UInt4FusedQTy in the Function.
+  bool convert4BitFusedToFP32{false};
+
+  /// Whether to convert indices in FusedRowwiseSLWS to Int64ITy.
+  bool convertIndicesToInt64{false};
+
   /// If convertToFP16, whether to convert input Placeholders.
   bool convertPlaceholdersToFP16{false};
 
@@ -91,6 +108,26 @@ struct PrecisionConfiguration {
   /// default blacklist. Currently only supported for convertToFP16.
   bool useSetAsWhitelist{false};
 
+  /// Pointer to a map of loader names to loaded quant params.
+  OriginNameToTQPMap *originNameToTQPMap{nullptr};
+
+  /// If true, then discard original quantization params that are loaded, to
+  /// instead track origin of quantization params in \ref originNameToTQPMap.
+  bool loadUniquedDummyQParams{false};
+
+  /// If true, when scales for qparams are loaded, they are clipped to
+  /// kMinScaleFP16 if below kMinScaleFP16.
+  bool zeroScaleFP16Clip{false};
+
+  /// If true, then the model that is loaded is expected to have been originally
+  /// serialized with dummy quantization parameters, and was replaced with
+  /// actual quantization parameters when loaded in this compilation context.
+  bool replaceDummyTQPs{false};
+
+  /// If true, then we can safely assume that all qparams (even dummy qparams)
+  /// are clipped inside the FP16 range.
+  bool clipQuantRangeToFP16{false};
+
   /// Converts a float16 \p format into an ElemKind.
   static ElemKind getElementType(Float16Format format) {
     switch (format) {
@@ -114,6 +151,9 @@ struct OptimizationOptions {
 
   /// If true, perform compile-time computation of constant operations.
   bool enableConstantFolding{true};
+
+  /// If true, perform compile-time deduplication of Constants.
+  bool enableConstantDeduplication{true};
 
   /// For all Splats in the Function being optimized, if they are used by any
   /// Nodes listed in this set, then they will be materialized into Constants
@@ -295,6 +335,9 @@ struct CompilationContext {
   /// Whether to use AOT mode for DAG optimizer.
   bool useDAGOptimizerAOTMode{false};
 
+  /// Whether we're loading a model that has been AOT optimized.
+  bool loadingAOTModel{false};
+
   /// Static placeholder type info used for AOT optimization.
   std::map<std::string, Type> staticPlaceholderTypesForAOT;
 
@@ -344,6 +387,16 @@ struct CompilationContext {
                         !optimizationOpts.delayAndRecordConstantModification),
                       "When serializing the compiled DAG, must also enable "
                       "delayAndRecordConstantModification.");
+
+    RETURN_ERR_IF_NOT(
+        !precisionConfig.loadUniquedDummyQParams ||
+            precisionConfig.originNameToTQPMap,
+        "If loading unique dummy QParams, must have valid originNameToTQPMap");
+
+    RETURN_ERR_IF_NOT(!precisionConfig.clipQuantRangeToFP16 ||
+                          precisionConfig.convertToFP16,
+                      "Assuming quant ranges are clipped to fp16 should only "
+                      "be done along with fp16 conversion.");
 
     return Error::success();
   }

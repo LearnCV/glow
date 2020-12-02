@@ -31,6 +31,16 @@
 
 using namespace glow;
 
+CPUBackend::CPUBackend() {
+  /// If target is not explicitly given we use the host attributes.
+  auto &opts = getOptions();
+  if (opts.getTarget().empty()) {
+    opts.setTarget(LLVMBackend::getHostTarget());
+    opts.setCPU(LLVMBackend::getHostCPU());
+    opts.setTargetFeatures(LLVMBackend::getHostFeatures());
+  }
+}
+
 /// We compile the standard library (libjit) to LLVM bitcode, and then convert
 /// that binary data to an include file using an external utility (include-bin).
 /// The resulting file is included here to compile the bitcode image into our
@@ -60,6 +70,7 @@ bool CPUBackend::shouldLower(const Node *N) const {
   switch (N->getKind()) {
   case Kinded::Kind::ReluNodeKind:
   case Kinded::Kind::ClipNodeKind:
+  case Kinded::Kind::LeakyReluNodeKind:
   case Kinded::Kind::ConvolutionNodeKind:
   case Kinded::Kind::SparseLengthsSumNodeKind:
     return false;
